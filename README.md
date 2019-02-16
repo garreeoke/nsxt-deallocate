@@ -25,6 +25,7 @@ _Optional_
     * user for nsx manager, admin is default
 * --delete
     * use true if you want to execute the delete
+    * Not including this option should just print out the orphaned ips, run this first!
     
 ### Example ###
 
