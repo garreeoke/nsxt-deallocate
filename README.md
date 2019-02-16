@@ -3,11 +3,14 @@ Clean up orphaned NSX-T IP addresses from a VIP pool.
 
 USE AT YOUR OWN RISK!
 
+### Run on a linux box ###
+
+* Download the nsxt-deallocate-linux.tgz from the artifacts directory.
+* tar xzvf ./nsxt-deallocate-linux.tgz
 
 ### Arguments ###
 
 _Required_
-
 * --t0 
     * uuid of the t0 router to check nat rules on
 * --pool-id
