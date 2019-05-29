@@ -7,30 +7,109 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
+	"os"
+	"strconv"
+	"time"
 )
 
-// Clean up orphaned nsx-t vip pool addresses
-// #1 get all allocated IP addresses for the given ip pool id
-// #2 For each load balancer, get the IP addresses from virtual servers
-// #3 Get all IP addresses from the given T0 used for NAT
-// #4 Match the list of vip pool addresses #1 to those found ... delete if they are not found
-
-var t0 = flag.String("t0-id", "", "ID of t0 router")
-var pool = flag.String("pool-id", "", "ID of ip pool to clean up")
+// Trace flow
 var nsx = flag.String("nsx-ip", "", "IP address of nsx manager")
 var user = flag.String("nsx-user", "admin", "Name of nsx users if other than admin")
-var pass = flag.String("nsx-pass", "", "NSX password if not VMware1!")
-var delete = flag.Bool("delete", false, "Execute the delete")
+var project = flag.String("namespace", "", "Kubernetes namespace")
+var srcPod = flag.String("src-pod", "", "Pod name of the source")
+var srcPort = flag.String("src-port", "8080", "Port for the source")
+var dstPod = flag.String("dst-pod", "", "Pod name of the destination")
+var dstPort = flag.String("dst-port", "", "Port for the destination")
+
+//var proto = flag.String("proto", "tcp", "Protocol for the trace")
+var payload = flag.String("payload", "", "Name of nsx users if other than admin")
+var pass = flag.String("nsx-pass", "", "NSX password")
+var dstProject = flag.String("dst-namespace", "", "Kubernetes namespace")
 
 const (
-	httpGet = "GET"
-	httpPOST = "POST"
+	httpGet  = "GET"
+	httpPost = "POST"
 )
+
+type Args struct {
+	NsxManager string
+	NsxUser    string
+	NsxPass    string
+	Project    string
+	SrcPod     string
+	SrcPort    string
+	DstPod     string
+	DstPort    string
+	Payload    string
+	DstProject string
+}
+
+func validate(a *Args) bool {
+	// Check for some values that could be env variables
+	if a.NsxManager == "" {
+		a.NsxManager = os.Getenv("NSX_MANAGER")
+		if a.NsxManager == "" {
+			return false
+		}
+	}
+	if a.NsxUser == "admin" {
+		a.NsxUser = os.Getenv("NSX_USER")
+		if a.NsxUser == "" {
+			a.NsxUser = "admin"
+		}
+	}
+	if a.NsxPass == "" {
+		a.NsxPass = os.Getenv("NSX_PASS")
+		if a.NsxPass == "" {
+			return false
+		}
+	}
+	// Check the rest of the required variables
+	if a.Project == "" || a.SrcPod == "" || a.SrcPort == "" || a.DstPod == "" || a.DstPort == "" {
+		fmt.Println("Missing required variable")
+	}
+
+	return true
+}
+
+func RequiredVars() {
+	fmt.Println("Required:")
+	fmt.Println("	--nsx-ip ", "Or set NSX_MANAGER env variable")
+	fmt.Println("	--nsx-pass ", "Or set NSX_PASS env variable")
+	fmt.Println("	--namespace")
+	fmt.Println("	--src-pod")
+	fmt.Println("	--src-port")
+	fmt.Println("	--dst-pod")
+	fmt.Println("	--dst-port")
+	fmt.Println("")
+	fmt.Println("Optional:")
+	fmt.Println("	--dst-namespace ", "If destination namespace is different than source")
+	fmt.Println("	--payload ", "Optional text payload")
+}
 
 func main() {
 
 	flag.Parse()
+	a := Args{
+		NsxManager: *nsx,
+		NsxUser:    *user,
+		Project:    *project,
+		SrcPod:     *srcPod,
+		SrcPort:    *srcPort,
+		DstPod:     *dstPod,
+		DstPort:    *dstPort,
+		Payload:    *payload,
+		NsxPass:    *pass,
+		DstProject: *dstProject,
+	}
+
+	valid := validate(&a)
+	if !valid {
+		RequiredVars()
+		os.Exit(1)
+	}
 
 	client := http.Client{
 		Transport: &http.Transport{
@@ -39,185 +118,307 @@ func main() {
 			},
 		},
 	}
-	// Get allocated ips
-	allocatedIps, err := getAllocations(&client)
+
+	sp, _ := strconv.Atoi(a.SrcPort)
+	dp, _ := strconv.Atoi(a.DstPort)
+	trace := TraceRequest{
+		Timeout: 5000,
+		Packet: Packet{
+			ResourceType: "FieldsPacketData",
+			//FrameSize:     128,
+			Routed:        false,
+			TransportType: "UNICAST",
+			Payload:       a.Payload,
+			TransportHeader: TransportHeader{
+				TcpHeader{
+					SrcPort:  sp,
+					DstPort:  dp,
+					TcpFlags: 2,
+				},
+			},
+			IpHeader: IpHeader{
+				Protocol: 6,
+				Ttl:      64,
+				Flags:    0,
+			},
+			EthHeader: EthHeader{
+				EthType: "2048",
+			},
+		},
+	}
+
+	// Logical Ports
+	srcLogicalPort, err := getLogicalPort(&client, a.SrcPod, a.Project, &a)
 	if err != nil {
-		fmt.Println(err)
+		log.Fatalln("Error getting source logical port: ", err)
 	}
+	trace.LogicalPortId = srcLogicalPort.Id
+	trace.Packet.IpHeader.SrcIp = srcLogicalPort.AddressBindings[0]["ip_address"]
+	trace.Packet.EthHeader.SrcMac = srcLogicalPort.AddressBindings[0]["mac_address"]
 
-	// Get load balancer used ips
-	lbIps, err := getLBIps(&client)
+	if a.DstProject == "" {
+		a.DstProject = a.Project
+	}
+	dstLogicalPort, err := getLogicalPort(&client, a.DstPod, a.DstProject, &a)
 	if err != nil {
-		fmt.Println(err)
+		log.Fatalln("Error getting destination logical port: ", err)
 	}
+	trace.Packet.IpHeader.DstIp = dstLogicalPort.AddressBindings[0]["ip_address"]
+	trace.Packet.EthHeader.DstMac = dstLogicalPort.AddressBindings[0]["mac_address"]
 
-	// Get Nat rule ips
-	natIps, err := getNatIps(&client)
+	tr, err := PostTrace(&client, &trace, &a)
 	if err != nil {
-		fmt.Println(err)
+		log.Fatalln("Error during post: ", err)
 	}
 
-	usedIps := append(lbIps,natIps...)
-	var deleteIps []string
-	for _,allocatedIp := range allocatedIps {
-		used := 0
-		for _, usedIp := range usedIps {
-			if usedIp == allocatedIp {
-				used++
-			}
+	fmt.Print("Traceflow in progress ")
+	// Wait for Trace to finish
+	for tr.OpState == "IN_PROGRESS" {
+		fmt.Print(".")
+		time.Sleep(1000 * time.Millisecond)
+		err = GetTrace(&client, tr, &a)
+		if err != nil {
+			log.Fatalln("Error getting trace result: ", err)
 		}
-		if used == 0 {
-			deleteIps = append(deleteIps, allocatedIp)
+	}
+	fmt.Println("")
+
+	if tr.OpState != "FINISHED" {
+		log.Fatalln("Traceroute did not finish correctly")
+	}
+
+	// Get the observations
+	err = GetObservations(&client, tr, &a)
+	if err != nil {
+		log.Fatalln("Could not get observations: ", err)
+	}
+
+	dropped := false
+	for _, observation := range tr.Observations {
+		if observation.Reason == "FW_RULE" {
+			dropped = true
+			fmt.Println("Dropped Firewall RuleId: ", observation.ACLRuleId)
+			// Maybe get firewall info
 		}
 	}
 
-	for _,deleteIp := range deleteIps {
-		fmt.Println("OrphanedIP: ", deleteIp)
-	}
-
-	if len(deleteIps) > 0 {
-		if *delete {
-			fmt.Println("Deleting Ips")
-			unallocateIps(&client, deleteIps)
-		}
-	} else {
-		fmt.Println("No orphaned IPs to delete")
+	if !dropped {
+		fmt.Println("Delivered")
 	}
 
 }
 
-func unallocateIps (c *http.Client, ips []string) error {
+func GetObservations(c *http.Client, tr *TraceResult, a *Args) error {
+	url := "https://" + a.NsxManager + "/api/v1/traceflows/" + tr.Id + "/observations"
+	h := HttpInfo{
+		Client: c,
+		Url:    url,
+		Method: httpGet,
+	}
+	err := httpCall(&h)
+	if err != nil {
+		return err
+	}
+	var observations ObservationResult
+	err = json.Unmarshal(h.Output, &observations)
+	if err != nil {
+		return err
+	}
+	for _, o := range observations.Results {
+		tr.Observations = append(tr.Observations, o)
+	}
 
-	for _,ip := range ips {
-		fmt.Println("DeletingIP: ", ip)
-		url := "https://" + *nsx + "/api/v1/pools/ip-pools/" + *pool + "?action=RELEASE"
-		m := map[string]string{
-			"allocation_id" : ip,
-		}
-		payload, err := json.Marshal(m)
-		if err != nil {
-			return err
-		}
-		_, err = httpCall(c, url, httpPOST, payload)
-		if err != nil {
-			return err
-		}
-		fmt.Println("Successfully deleted: ", ip)
+	return nil
+}
 
+func GetTrace(c *http.Client, tr *TraceResult, a *Args) error {
+	url := "https://" + a.NsxManager + "/api/v1/traceflows/" + tr.Id
+	h := HttpInfo{
+		Client: c,
+		Url:    url,
+		Method: httpGet,
+	}
+	err := httpCall(&h)
+	if err != nil {
+		return err
+	}
+	err = json.Unmarshal(h.Output, &tr)
+	if err != nil {
+		return err
 	}
 	return nil
 }
 
-func getNatIps (c *http.Client) ([]string, error) {
-
-	url := "https://" + *nsx + "/api/v1/logical-routers/" + *t0 + "/nat/rules"
-	result, err := httpCall(c, url, httpGet, nil)
+func PostTrace(c *http.Client, request *TraceRequest, a *Args) (*TraceResult, error) {
+	tr := TraceResult{}
+	url := "https://" + a.NsxManager + "/api/v1/traceflows"
+	t, err := json.Marshal(request)
 	if err != nil {
-		return nil, err
+		return &tr, err
 	}
-	natIps := make([]string, len(result.Results))
-	for i,res := range result.Results {
-		natIps[i] = res.TranIP
+	h := HttpInfo{
+		Client: c,
+		Url:    url,
+		Method: httpPost,
+		Input:  t,
+	}
+	err = httpCall(&h)
+	if err != nil {
+		return &tr, err
+	}
+	err = json.Unmarshal(h.Output, &tr)
+	if err != nil {
+		return &tr, err
 	}
 
-	return natIps, nil
+	return &tr, nil
 }
 
-// Get LoadBalancer ids
-func getLBIps(c *http.Client) ([]string, error) {
+func getLogicalPort(c *http.Client, pod, nameSpace string, a *Args) (*LogicalPort, error) {
 
-	url := "https://" + *nsx + "/api/v1/loadbalancer/services"
-	result, err := httpCall(c, url, httpGet, nil)
+	var logicalPort *LogicalPort
+	url := "https://" + a.NsxManager + "/api/v1/logical-ports/"
+	h := HttpInfo{
+		Client: c,
+		Url:    url,
+		Method: httpGet,
+	}
+	err := httpCall(&h)
 	if err != nil {
-		return nil, err
+		return logicalPort, err
 	}
 
-	var lbIps []string
-	for _, res := range result.Results {
-		// Get virtual server ids
-		for _, vsi := range res.VirtualServerIds {
-			// Get IP address and add it
-			url2 := "https://" + *nsx + "/api/v1/loadbalancer/virtual-servers"
-			result2, err := httpCall(c, url2, httpGet, nil)
-			if err != nil {
-				return nil, err
+	var logicalPortsResult LogicalPortResult
+	err = json.Unmarshal(h.Output, &logicalPortsResult)
+	if err != nil {
+		return logicalPort, err
+	}
+
+	for _, lp := range logicalPortsResult.Result {
+		podCheck := false
+		nsCheck := false
+		// Check for tags
+		for _, tag := range lp.Tags {
+			if tag["scope"] == "ncp/pod" && tag["tag"] == pod {
+				podCheck = true
 			}
-			for _,virtualServer := range result2.Results {
-				if virtualServer.ID == vsi {
-					check := 0
-					for _,l := range lbIps {
-						if l == virtualServer.IP {
-							check++
-						}
-					}
-					if check == 0 {
-						lbIps = append(lbIps,virtualServer.IP)
-					}
-				}
+			if tag["scope"] == "ncp/project" && tag["tag"] == nameSpace {
+				nsCheck = true
 			}
+		}
+		if podCheck && nsCheck {
+			logicalPort = &lp
+			break
 		}
 	}
 
-	return lbIps, nil
+	return logicalPort, nil
 }
 
-func getAllocations(c *http.Client) ([]string, error) {
+type TraceResult struct {
+	Id           string `json:"id,omitempty"`
+	OpState      string `json:"operation_state,omitempty"`
+	Observations []Observation
+}
 
-	url := "https://" + *nsx + "/api/v1/pools/ip-pools/" + *pool + "/allocations"
-	result, err := httpCall(c, url, httpGet, nil)
+type LogicalPortResult struct {
+	Result []LogicalPort `json:"results,omitempty"`
+}
+
+type LogicalPort struct {
+	Id              string              `json:"id,omitempty"`
+	DisplayName     string              `json:"display_name,omitempty"`
+	AdminState      string              `json:"admin_state,omitempty"`
+	Tags            []map[string]string `json:"tags,omitempty"`
+	LogicalSwitchId string              `json:"logical_switch_id,omitempty"`
+	AddressBindings []map[string]string `json:"address_bindings,omitempty"`
+}
+
+type TraceRequest struct {
+	Timeout       int `json:"timeout,omitempty"`
+	Packet        `json:"packet,omitempty"`
+	LogicalPortId string `json:"lport_id,omitempty"`
+}
+
+type Param struct {
+	Timeout       string `json:"timeout,omitempty"`
+	LogicalPortId string `json:"lport_id,omitempty"`
+	Packet        `json:"packet,omitempty"`
+}
+
+type Packet struct {
+	ResourceType    string `json:"resource_type,omitempty"`
+	Routed          bool   `json:"routed,omitempty"`
+	TransportType   string `json:"transport_type,omitempty"`
+	Payload         string `json:"payload,omitempty"`
+	IpHeader        `json:"ip_header,omitempty"`
+	EthHeader       `json:"eth_header,omitempty"`
+	TransportHeader `json:"transport_header,omitempty"`
+}
+
+type IpHeader struct {
+	SrcIp    string `json:"src_ip,omitempty"`
+	DstIp    string `json:"dst_ip,omitempty"`
+	Protocol int    `json:"protocol,omitempty"`
+	Ttl      int    `json:"ttl,omitempty"`
+	Flags    int    `json:"flags,omitempty"`
+}
+
+type EthHeader struct {
+	SrcMac  string `json:"src_mac,omitempty"`
+	DstMac  string `json:"dst_mac,omitempty"`
+	EthType string `json:"eth_type,omitempty"`
+}
+
+type TransportHeader struct {
+	TcpHeader `json:"tcp_header,omitempty"`
+}
+
+type TcpHeader struct {
+	SrcPort  int `json:"src_port,omitempty"`
+	DstPort  int `json:"dst_port,omitempty"`
+	TcpFlags int `json:"tcp_flags,omitempty"`
+}
+
+type ObservationResult struct {
+	Results []Observation `json:"results,omitempty"`
+}
+
+type Observation struct {
+	ComponentType   string `json:"component_type,omitempty"`
+	ComponentName   string `json:"component_name,omitempty"`
+	ACLRuleId       int    `json:"acl_rule_id,omitempty"`
+	LogicalPortId   string `json:"lport_id,omitempty"`
+	LogicalPortName string `json:"lport_name,omitempty"`
+	Reason          string `json:"reason,omitempty"`
+}
+
+func httpCall(h *HttpInfo) error {
+	req, err := http.NewRequest(h.Method, h.Url, bytes.NewBuffer(h.Input))
 	if err != nil {
-		return nil, err
-	}
-
-	// Generate the list
-	ips := make([]string, len(result.Results))
-	for i, res := range result.Results {
-		ips[i] = res.AllocationID
-	}
-
-	return ips, nil
-}
-
-type Data struct {
-	Count   int      `json:"result_count,omitempty"`
-	Results []Result `json:"results,omitempty"`
-}
-
-type Result struct {
-	ID               string   `json:"id,omitempty"`
-	AllocationID     string   `json:"allocation_id,omitempty"`
-	VirtualServerIds []string `json:"virtual_server_ids,omitempty"`
-	IP               string   `json:"ip_address,omitempty"`
-	TranIP           string   `json:"translated_network,omitempty"`
-}
-
-func httpCall(c *http.Client, url,method string, data []byte) (*Data, error) {
-	req, err := http.NewRequest(method, url, bytes.NewBuffer(data))
-	if err != nil {
-		return nil, err
+		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.SetBasicAuth(*user, *pass)
-	resp, err := c.Do(req)
+	resp, err := h.Client.Do(req)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	if method == httpGet {
-		r, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return nil, err
-		}
-		resp.Body.Close()
-
-		var result Data
-		err = json.Unmarshal(r, &result)
-		if err != nil {
-			return nil, err
-		}
-		return &result, nil
-	} else {
-		return nil, nil
+	h.Output, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
 	}
+	resp.Body.Close()
+
+	return nil
+}
+
+type HttpInfo struct {
+	Client *http.Client
+	Url    string
+	Method string
+	Input  []byte
+	Output []byte
 }

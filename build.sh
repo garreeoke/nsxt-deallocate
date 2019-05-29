@@ -11,6 +11,6 @@ export GOARCH="${ARCH}"
 export GOOS="${OS}"
 
 # build linux
-env GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o nsxt-deallocate main.go
-tar -czf artifacts/nsxt-deallocate-linux.tgz nsxt-deallocate
-rm nsxt-deallocate
+env GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o nsxt-trace main.go
+tar -czf artifacts/nsxt-trace-linux.tgz nsxt-trace
+rm nsxt-trace
